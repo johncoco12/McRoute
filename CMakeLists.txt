@@ -15,7 +15,7 @@ if(WIN32)
         REQUIRED
     )
     find_library(CURSES_LIBRARY
-        NAMES pdcurses curses
+        NAMES pdcurses_wincon pdcurses
         HINTS
             /mingw64/lib
             "$ENV{MINGW_PREFIX}/lib"
