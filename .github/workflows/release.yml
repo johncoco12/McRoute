@@ -1,0 +1,64 @@
+name: Build release binaries
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libncurses-dev
+      - name: Build
+        run: cmake -S . -B build && cmake --build build --config Release -j2
+      - name: Package
+        run: tar -czf MCRoute-linux-x64.tar.gz -C build MCRoute
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MCRoute-linux-x64
+          path: MCRoute-linux-x64.tar.gz
+
+  windows:
+    name: Windows binary
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ncurses
+            mingw-w64-x86_64-pdcurses
+      - name: Build
+        run: cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release && cmake --build build -j2
+      - name: Package
+        run: 7z a MCRoute-windows-x64.zip ./build/MCRoute.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MCRoute-windows-x64
+          path: MCRoute-windows-x64.zip
+
+  attach:
+    name: Attach binaries to release
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
