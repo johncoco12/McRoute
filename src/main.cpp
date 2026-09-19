@@ -38,6 +38,14 @@ inline int poll_sockets(PollDescriptor *sockets, ULONG count, int timeout) {
 }
 inline int socket_error() { return WSAGetLastError(); }
 inline void close_socket(SocketHandle socket) { closesocket(socket); }
+inline int set_socket_option(SocketHandle socket, int level, int name,
+                             const void *value, int length) {
+  return setsockopt(socket, level, name, static_cast<const char *>(value), length);
+}
+inline int get_socket_option(SocketHandle socket, int level, int name,
+                             void *value, int *length) {
+  return getsockopt(socket, level, name, static_cast<char *>(value), length);
+}
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -57,6 +65,14 @@ inline int poll_sockets(PollDescriptor *sockets, nfds_t count, int timeout) {
 }
 inline int socket_error() { return errno; }
 inline void close_socket(SocketHandle socket) { close(socket); }
+inline int set_socket_option(SocketHandle socket, int level, int name,
+                             const void *value, socklen_t length) {
+  return setsockopt(socket, level, name, value, length);
+}
+inline int get_socket_option(SocketHandle socket, int level, int name,
+                             void *value, socklen_t *length) {
+  return getsockopt(socket, level, name, value, length);
+}
 #endif
 
 namespace {
@@ -266,7 +282,7 @@ public:
       return false;
     }
     int reuse = 1;
-    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    set_socket_option(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -342,8 +358,8 @@ private:
       #else
           socklen_t error_size = sizeof(connection_error);
       #endif
-          getsockopt(target, SOL_SOCKET, SO_ERROR, &connection_error,
-                     &error_size);
+          get_socket_option(target, SOL_SOCKET, SO_ERROR, &connection_error,
+                            &error_size);
           if (connection_error == 0)
             result = 0;
         }
@@ -561,7 +577,7 @@ private:
     return true;
   }
 
-  static void bridge(int client, std::shared_ptr<Preset> preset,
+  static void bridge(SocketHandle client, std::shared_ptr<Preset> preset,
                      DebugLog *log) {
     log->add("Client connected; waiting for Minecraft handshake");
     std::vector<char> handshake;
