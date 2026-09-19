@@ -6,8 +6,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(WIN32)
-    find_path(CURSES_INCLUDE_DIR curses.h REQUIRED)
-    find_library(CURSES_LIBRARY NAMES pdcurses curses REQUIRED)
+    find_path(CURSES_INCLUDE_DIR
+        NAMES curses.h
+        HINTS
+            /mingw64/include
+            "$ENV{MINGW_PREFIX}/include"
+        PATH_SUFFIXES pdcurses
+        REQUIRED
+    )
+    find_library(CURSES_LIBRARY
+        NAMES pdcurses curses
+        HINTS
+            /mingw64/lib
+            "$ENV{MINGW_PREFIX}/lib"
+        REQUIRED
+    )
     set(CURSES_INCLUDE_DIRS ${CURSES_INCLUDE_DIR})
     set(CURSES_LIBRARIES ${CURSES_LIBRARY})
 else()

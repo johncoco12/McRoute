@@ -39,10 +39,9 @@ jobs:
           install: >-
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ncurses
             mingw-w64-x86_64-pdcurses
       - name: Build
-        run: cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release && cmake --build build -j2
+        run: cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$MINGW_PREFIX" && cmake --build build -j2
       - name: Package
         run: 7z a MCRoute-windows-x64.zip ./build/MCRoute.exe
       - uses: actions/upload-artifact@v4
