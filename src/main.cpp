@@ -1,27 +1,63 @@
 #include <algorithm>
-#include <arpa/inet.h>
 #include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#ifdef _WIN32
+#include <curses.h>
+#else
 #include <ncurses.h>
 #include <netdb.h>
-#include <netinet/in.h>
-#include <poll.h>
+#endif
 #include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+using SocketHandle = SOCKET;
+using PollDescriptor = WSAPOLLFD;
+constexpr SocketHandle InvalidSocket = INVALID_SOCKET;
+constexpr short ReadEvent = POLLRDNORM;
+constexpr int ShutdownBoth = SD_BOTH;
+constexpr int ShutdownWrite = SD_SEND;
+inline int poll_sockets(PollDescriptor *sockets, ULONG count, int timeout) {
+  return WSAPoll(sockets, count, timeout);
+}
+inline int socket_error() { return WSAGetLastError(); }
+inline void close_socket(SocketHandle socket) { closesocket(socket); }
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <thread>
 #include <unistd.h>
-#include <vector>
+using SocketHandle = int;
+using PollDescriptor = pollfd;
+constexpr SocketHandle InvalidSocket = -1;
+constexpr short ReadEvent = POLLIN;
+constexpr int ShutdownBoth = SHUT_RDWR;
+constexpr int ShutdownWrite = SHUT_WR;
+inline int poll_sockets(PollDescriptor *sockets, nfds_t count, int timeout) {
+  return poll(sockets, count, timeout);
+}
+inline int socket_error() { return errno; }
+inline void close_socket(SocketHandle socket) { close(socket); }
+#endif
 
 namespace {
 
@@ -225,7 +261,7 @@ public:
 
   bool start(uint16_t listen_port, std::string &error) {
     listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) {
+    if (listen_fd_ == InvalidSocket) {
       error = std::strerror(errno);
       return false;
     }
@@ -239,8 +275,8 @@ public:
              sizeof(address)) < 0 ||
         listen(listen_fd_, 32) < 0) {
       error = std::strerror(errno);
-      close(listen_fd_);
-      listen_fd_ = -1;
+      close_socket(listen_fd_);
+      listen_fd_ = InvalidSocket;
       return false;
     }
     running_ = true;
@@ -257,8 +293,8 @@ public:
   void stop() {
     if (!running_.exchange(false))
       return;
-    shutdown(listen_fd_, SHUT_RDWR);
-    close(listen_fd_);
+    shutdown(listen_fd_, ShutdownBoth);
+    close_socket(listen_fd_);
     if (accept_thread_.joinable())
       accept_thread_.join();
   }
@@ -269,27 +305,43 @@ private:
     return active_;
   }
 
-  static int connect_target(const Preset &preset) {
+  static SocketHandle connect_target(const Preset &preset) {
     addrinfo hints{};
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_family = AF_UNSPEC;
     addrinfo *results = nullptr;
     const auto port = std::to_string(preset.port);
     if (getaddrinfo(preset.host.c_str(), port.c_str(), &hints, &results) != 0)
-      return -1;
-    int target = -1;
+      return InvalidSocket;
+    SocketHandle target = InvalidSocket;
     for (addrinfo *item = results; item; item = item->ai_next) {
       target = socket(item->ai_family, item->ai_socktype, item->ai_protocol);
-      if (target < 0)
+      if (target == InvalidSocket)
         continue;
+    #ifdef _WIN32
+      u_long nonblocking = 1;
+      ioctlsocket(target, FIONBIO, &nonblocking);
+      int result = connect(target, item->ai_addr, static_cast<int>(item->ai_addrlen));
+    #else
       const int flags = fcntl(target, F_GETFL, 0);
       fcntl(target, F_SETFL, flags | O_NONBLOCK);
       int result = connect(target, item->ai_addr, item->ai_addrlen);
-      if (result < 0 && errno == EINPROGRESS) {
-        pollfd wait_socket{target, POLLOUT, 0};
-        if (poll(&wait_socket, 1, 5000) > 0) {
+    #endif
+      if (result < 0 && socket_error() ==
+    #ifdef _WIN32
+          WSAEINPROGRESS
+    #else
+          EINPROGRESS
+    #endif
+      ) {
+        PollDescriptor wait_socket{target, POLLOUT, 0};
+        if (poll_sockets(&wait_socket, 1, 5000) > 0) {
           int connection_error = 0;
+      #ifdef _WIN32
+          int error_size = sizeof(connection_error);
+      #else
           socklen_t error_size = sizeof(connection_error);
+      #endif
           getsockopt(target, SOL_SOCKET, SO_ERROR, &connection_error,
                      &error_size);
           if (connection_error == 0)
@@ -297,20 +349,25 @@ private:
         }
       }
       if (result == 0) {
+#ifdef _WIN32
+        nonblocking = 0;
+        ioctlsocket(target, FIONBIO, &nonblocking);
+#else
         fcntl(target, F_SETFL, flags);
+#endif
         break;
       }
-      close(target);
-      target = -1;
+      close_socket(target);
+      target = InvalidSocket;
     }
     freeaddrinfo(results);
     return target;
   }
 
-  static bool send_all(int socket, const std::vector<char> &bytes) {
+  static bool send_all(SocketHandle socket, const std::vector<char> &bytes) {
     size_t sent = 0;
     while (sent < bytes.size()) {
-      const ssize_t written =
+      const int written =
           send(socket, bytes.data() + sent, bytes.size() - sent, MSG_NOSIGNAL);
       if (written <= 0)
         return false;
@@ -319,10 +376,10 @@ private:
     return true;
   }
 
-  static bool receive_exact(int socket, char *buffer, size_t size) {
+  static bool receive_exact(SocketHandle socket, char *buffer, size_t size) {
     size_t received = 0;
     while (received < size) {
-      const ssize_t count = recv(socket, buffer + received, size - received, 0);
+      const int count = recv(socket, buffer + received, static_cast<int>(size - received), 0);
       if (count <= 0)
         return false;
       received += static_cast<size_t>(count);
@@ -330,7 +387,7 @@ private:
     return true;
   }
 
-  static bool receive_packet(int socket, std::vector<char> &packet) {
+  static bool receive_packet(SocketHandle socket, std::vector<char> &packet) {
     packet.clear();
     int32_t length = 0;
     int shift = 0;
@@ -411,7 +468,7 @@ private:
     return true;
   }
 
-  static bool serve_status(int client, const Preset &preset, DebugLog *log) {
+  static bool serve_status(SocketHandle client, const Preset &preset, DebugLog *log) {
     std::vector<char> request;
     std::vector<char> request_payload;
     int32_t packet_id = 0;
@@ -510,25 +567,25 @@ private:
     std::vector<char> handshake;
     if (!receive_packet(client, handshake)) {
       log->add("Client disconnected before sending a valid handshake");
-      close(client);
+      close_socket(client);
       return;
     }
 
     if (detect_status_handshake(handshake)) {
       log->add("Server-list request received for " + preset->name);
       serve_status(client, *preset, log);
-      shutdown(client, SHUT_RDWR);
-      close(client);
+      shutdown(client, ShutdownBoth);
+      close_socket(client);
       return;
     }
 
     log->add("Login request received; connecting to " + preset->host + ":" +
              std::to_string(preset->port));
-    const int target = connect_target(*preset);
-    if (target < 0) {
+    const SocketHandle target = connect_target(*preset);
+    if (target == InvalidSocket) {
       log->add("Target unavailable: " + preset->name + " (" + preset->host +
                ":" + std::to_string(preset->port) + ")");
-      close(client);
+      close_socket(client);
       return;
     }
     log->add("Connected client to " + preset->name + " (" + preset->host + ":" +
@@ -537,20 +594,26 @@ private:
     if (!rewrite_handshake_target(handshake, *preset, target_handshake) ||
         !send_all(target, target_handshake)) {
       log->add("Could not forward the Minecraft handshake to " + preset->name);
-      close(client);
-      close(target);
+      close_socket(client);
+      close_socket(target);
       return;
     }
 
-    pollfd sockets[] = {{client, POLLIN, 0}, {target, POLLIN, 0}};
+    PollDescriptor sockets[] = {{client, ReadEvent, 0}, {target, ReadEvent, 0}};
     bool client_open = true;
     bool target_open = true;
     char buffer[8192];
     while (client_open || target_open) {
-      sockets[0].events = client_open ? POLLIN : 0;
-      sockets[1].events = target_open ? POLLIN : 0;
-      if (poll(sockets, 2, -1) < 0) {
-        if (errno == EINTR)
+      sockets[0].events = client_open ? ReadEvent : 0;
+      sockets[1].events = target_open ? ReadEvent : 0;
+      if (poll_sockets(sockets, 2, -1) < 0) {
+        if (socket_error() ==
+#ifdef _WIN32
+            WSAEINTR
+#else
+            EINTR
+#endif
+        )
           continue;
         break;
       }
@@ -558,15 +621,15 @@ private:
       for (int direction = 0; direction < 2; ++direction) {
         if (!sockets[direction].revents)
           continue;
-        const int from = sockets[direction].fd;
-        const int to = sockets[1 - direction].fd;
-        const ssize_t received = recv(from, buffer, sizeof(buffer), 0);
+        const SocketHandle from = sockets[direction].fd;
+        const SocketHandle to = sockets[1 - direction].fd;
+        const int received = recv(from, buffer, sizeof(buffer), 0);
         if (received <= 0) {
           if (direction == 0)
             client_open = false;
           else
             target_open = false;
-          shutdown(to, SHUT_WR);
+          shutdown(to, ShutdownWrite);
           continue;
         }
         std::vector<char> outgoing(buffer, buffer + received);
@@ -577,16 +640,16 @@ private:
         }
       }
     }
-    shutdown(client, SHUT_RDWR);
-    shutdown(target, SHUT_RDWR);
-    close(client);
-    close(target);
+    shutdown(client, ShutdownBoth);
+    shutdown(target, ShutdownBoth);
+    close_socket(client);
+    close_socket(target);
   }
 
   void accept_loop() {
     while (running_) {
-      const int client = accept(listen_fd_, nullptr, nullptr);
-      if (client < 0) {
+      const SocketHandle client = accept(listen_fd_, nullptr, nullptr);
+      if (client == InvalidSocket) {
         if (running_)
           continue;
         break;
@@ -600,7 +663,7 @@ private:
   std::mutex active_mutex_;
   DebugLog &log_;
   std::atomic<bool> running_{false};
-  int listen_fd_ = -1;
+  SocketHandle listen_fd_ = InvalidSocket;
   std::thread accept_thread_;
 };
 
@@ -736,6 +799,13 @@ bool add_preset(PresetStore &store) {
 } // namespace
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+  WSADATA winsock_data{};
+  if (WSAStartup(MAKEWORD(2, 2), &winsock_data) != 0) {
+    std::cerr << "Could not initialize Windows sockets\n";
+    return 1;
+  }
+#endif
   uint16_t listen_port = 25565;
   std::string path = config_path();
   std::string requested_preset;
@@ -754,6 +824,9 @@ int main(int argc, char **argv) {
     } else if (argument == "--help") {
       std::cout << "Usage: MCRoute [--listen PORT] [--config FILE] [--preset "
                    "NAME]\n";
+    #ifdef _WIN32
+      WSACleanup();
+    #endif
       return 0;
     }
   }
@@ -772,6 +845,9 @@ int main(int argc, char **argv) {
   if (!proxy.start(listen_port, error)) {
     std::cerr << "Could not listen on port " << listen_port << ": " << error
               << '\n';
+#ifdef _WIN32
+    WSACleanup();
+#endif
     return 1;
   }
 
@@ -832,5 +908,8 @@ int main(int argc, char **argv) {
   }
   endwin();
   proxy.stop();
+#ifdef _WIN32
+  WSACleanup();
+#endif
   return 0;
 }
